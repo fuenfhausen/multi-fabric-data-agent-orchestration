@@ -364,9 +364,15 @@ def list_workspace_items(
 
 ## Authentication & Security
 
-### Identity Flow
+### Identity Flow Overview
+
+The multi-fabric agent orchestration uses a layered authentication model where credentials flow from the user through Microsoft Entra ID to various Fabric endpoints.
 
 ```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         AUTHENTICATION FLOW                                      │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │    User     │────►│  Microsoft Entra │────►│ Foundry Project │
 │             │     │       ID         │     │                 │
@@ -381,14 +387,282 @@ def list_workspace_items(
                     └───────────────┘         └───────────────┘         └───────────────┘
 ```
 
-### Required Permissions
+### Authentication Methods
 
-| Component | Permission | Scope |
-|-----------|-----------|-------|
-| Foundry Project | Cognitive Services User | Azure AI Services resource |
-| Fabric Workspace | Contributor or higher | Fabric workspace |
-| OneLake | Storage Blob Data Contributor | OneLake storage |
-| Semantic Link | Dataset.Read.All | Power BI workspace |
+| Method | Use Case | Token Audience | Best For |
+|--------|----------|----------------|----------|
+| **Delegated (User)** | Interactive queries | `https://api.fabric.microsoft.com/.default` | User-initiated operations |
+| **Managed Identity** | Background processing | `https://storage.azure.com/.default` | Automated pipelines |
+| **Service Principal** | Application access | `https://api.fabric.microsoft.com/.default` | CI/CD, scheduled jobs |
+
+### Credential Chain Implementation
+
+The agents use `DefaultAzureCredential` which provides a seamless authentication experience across development and production environments:
+
+```python
+from azure.identity import DefaultAzureCredential, ChainedTokenCredential, ManagedIdentityCredential, AzureCliCredential
+
+# Option 1: Default credential chain (recommended)
+# Tries: Environment → Managed Identity → Azure CLI → Interactive Browser
+credential = DefaultAzureCredential()
+
+# Option 2: Explicit chain for production
+credential = ChainedTokenCredential(
+    ManagedIdentityCredential(),  # First: Try managed identity (production)
+    AzureCliCredential()           # Fallback: Azure CLI (development)
+)
+```
+
+### Fabric API Authentication
+
+#### Token Acquisition for Fabric REST APIs
+
+```python
+from azure.identity import DefaultAzureCredential
+from azure.core.credentials import AccessToken
+import requests
+
+class FabricAuthenticator:
+    """Handles authentication for Microsoft Fabric APIs."""
+    
+    FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default"
+    STORAGE_SCOPE = "https://storage.azure.com/.default"
+    
+    def __init__(self, credential: DefaultAzureCredential = None):
+        self.credential = credential or DefaultAzureCredential()
+        self._token_cache: dict[str, AccessToken] = {}
+    
+    def get_fabric_token(self) -> str:
+        """Get access token for Fabric REST API calls."""
+        if self._is_token_expired(self.FABRIC_SCOPE):
+            self._token_cache[self.FABRIC_SCOPE] = self.credential.get_token(self.FABRIC_SCOPE)
+        return self._token_cache[self.FABRIC_SCOPE].token
+    
+    def get_storage_token(self) -> str:
+        """Get access token for OneLake storage operations."""
+        if self._is_token_expired(self.STORAGE_SCOPE):
+            self._token_cache[self.STORAGE_SCOPE] = self.credential.get_token(self.STORAGE_SCOPE)
+        return self._token_cache[self.STORAGE_SCOPE].token
+    
+    def _is_token_expired(self, scope: str) -> bool:
+        """Check if cached token is expired or missing."""
+        import time
+        if scope not in self._token_cache:
+            return True
+        # Refresh 5 minutes before expiry
+        return self._token_cache[scope].expires_on < time.time() + 300
+    
+    def get_headers(self) -> dict:
+        """Get HTTP headers for Fabric API requests."""
+        return {
+            "Authorization": f"Bearer {self.get_fabric_token()}",
+            "Content-Type": "application/json"
+        }
+```
+
+#### Using Authentication in Fabric Tools
+
+```python
+from agent_framework import ai_function
+from typing import Annotated
+
+# Global authenticator instance (initialized once)
+fabric_auth = FabricAuthenticator()
+
+@ai_function
+def execute_fabric_query(
+    workspace_id: Annotated[str, "The Fabric workspace GUID"],
+    query_type: Annotated[str, "Type: 'spark', 'tsql', or 'kql'"],
+    query: Annotated[str, "The query to execute"],
+    max_rows: Annotated[int, "Maximum rows to return"] = 1000
+) -> dict:
+    """Execute a query against Microsoft Fabric workloads."""
+    import requests
+    
+    base_url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}"
+    headers = fabric_auth.get_headers()
+    
+    if query_type == "tsql":
+        # SQL Analytics endpoint
+        endpoint = f"{base_url}/warehouses/query"
+        payload = {"query": query, "maxRows": max_rows}
+    elif query_type == "spark":
+        # Lakehouse Spark endpoint
+        endpoint = f"{base_url}/lakehouses/query"
+        payload = {"query": query, "maxRows": max_rows}
+    elif query_type == "kql":
+        # Eventhouse KQL endpoint
+        endpoint = f"{base_url}/eventhouses/query"
+        payload = {"query": query, "maxRows": max_rows}
+    else:
+        raise ValueError(f"Unsupported query type: {query_type}")
+    
+    response = requests.post(endpoint, headers=headers, json=payload)
+    response.raise_for_status()
+    return response.json()
+```
+
+### OneLake Authentication
+
+OneLake uses Azure Storage authentication with ABFS (Azure Blob File System) protocol:
+
+```python
+from azure.identity import DefaultAzureCredential
+from azure.storage.filedatalake import DataLakeServiceClient
+
+class OneLakeClient:
+    """Client for OneLake data operations."""
+    
+    def __init__(self, workspace_id: str, credential: DefaultAzureCredential = None):
+        self.workspace_id = workspace_id
+        self.credential = credential or DefaultAzureCredential()
+        
+        # OneLake endpoint format
+        account_url = f"https://onelake.dfs.fabric.microsoft.com"
+        self.service_client = DataLakeServiceClient(
+            account_url=account_url,
+            credential=self.credential
+        )
+    
+    def read_delta_table(self, lakehouse_name: str, table_name: str) -> list[dict]:
+        """Read data from a Delta table in OneLake."""
+        # Path format: <workspace_id>/<lakehouse_name>/Tables/<table_name>
+        file_system = self.service_client.get_file_system_client(self.workspace_id)
+        directory = file_system.get_directory_client(f"{lakehouse_name}/Tables/{table_name}")
+        
+        # Implementation would use delta-rs or similar library
+        # to read the Delta table format
+        pass
+    
+    def list_tables(self, lakehouse_name: str) -> list[str]:
+        """List all tables in a lakehouse."""
+        file_system = self.service_client.get_file_system_client(self.workspace_id)
+        tables_dir = file_system.get_directory_client(f"{lakehouse_name}/Tables")
+        
+        return [path.name for path in tables_dir.get_paths() if path.is_directory]
+```
+
+### SQL Endpoint Authentication
+
+For warehouse and lakehouse SQL endpoints, use pyodbc with Microsoft Entra ID authentication:
+
+```python
+import pyodbc
+from azure.identity import DefaultAzureCredential
+import struct
+
+class FabricSQLClient:
+    """Client for Fabric SQL endpoint queries."""
+    
+    def __init__(self, server: str, database: str, credential: DefaultAzureCredential = None):
+        self.server = server
+        self.database = database
+        self.credential = credential or DefaultAzureCredential()
+    
+    def _get_connection(self) -> pyodbc.Connection:
+        """Create authenticated connection to Fabric SQL endpoint."""
+        # Get access token
+        token = self.credential.get_token("https://database.windows.net/.default")
+        token_bytes = token.token.encode("UTF-16-LE")
+        token_struct = struct.pack(f'<I{len(token_bytes)}s', len(token_bytes), token_bytes)
+        
+        # Connection string for Fabric SQL endpoint
+        conn_str = (
+            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+            f"SERVER={self.server};"
+            f"DATABASE={self.database};"
+            f"Encrypt=yes;"
+            f"TrustServerCertificate=no;"
+        )
+        
+        conn = pyodbc.connect(conn_str, attrs_before={
+            1256: token_struct  # SQL_COPT_SS_ACCESS_TOKEN
+        })
+        return conn
+    
+    def execute_query(self, query: str) -> list[dict]:
+        """Execute a T-SQL query and return results."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(query)
+            columns = [column[0] for column in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+```
+
+### Required Permissions Matrix
+
+| Component | Role/Permission | Scope | Purpose |
+|-----------|----------------|-------|---------|
+| **Azure AI Services** | `Cognitive Services User` | AI Services resource | Agent model invocation |
+| **Azure AI Services** | `Cognitive Services Contributor` | AI Services resource | Agent management |
+| **Fabric Workspace** | `Contributor` | Workspace | Query execution, item access |
+| **Fabric Workspace** | `Admin` | Workspace | Manage connections, security |
+| **OneLake** | `Storage Blob Data Contributor` | Workspace storage | Read/write Delta tables |
+| **OneLake** | `Storage Blob Data Reader` | Workspace storage | Read-only access |
+| **Power BI** | `Dataset.Read.All` | Power BI workspace | Semantic model access |
+| **Power BI** | `Report.ReadWrite.All` | Power BI workspace | Report generation |
+
+### Service Principal Setup
+
+For production deployments, create a service principal with appropriate permissions:
+
+```bash
+# Create service principal
+az ad sp create-for-rbac --name "fabric-agent-orchestrator" --role "Contributor" \
+    --scopes /subscriptions/<subscription-id>/resourceGroups/<resource-group>
+
+# Grant Fabric workspace access (via Fabric Admin Portal or API)
+# 1. Add service principal to Fabric workspace as Contributor
+# 2. Enable "Service principals can use Fabric APIs" in tenant settings
+```
+
+### Environment Variables
+
+```env
+# Microsoft Entra ID (for Service Principal auth)
+AZURE_TENANT_ID=<tenant-guid>
+AZURE_CLIENT_ID=<client-id>
+AZURE_CLIENT_SECRET=<client-secret>
+
+# Microsoft Foundry Configuration
+AZURE_AI_SERVICES_ENDPOINT=https://fabric-agent-ai.services.ai.azure.com
+AZURE_OPENAI_ENDPOINT=https://fabric-agent-ai.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=gpt-4o
+
+# Microsoft Fabric Configuration
+FABRIC_WORKSPACE_ID=<workspace-guid>
+FABRIC_SQL_ENDPOINT=<workspace>.datawarehouse.fabric.microsoft.com
+FABRIC_LAKEHOUSE_SQL_ENDPOINT=<workspace>.dfs.fabric.microsoft.com
+```
+
+### Security Best Practices
+
+1. **Use Managed Identity** in production Azure deployments
+2. **Rotate secrets** regularly for service principal authentication
+3. **Apply least privilege** - grant only required permissions per agent
+4. **Enable audit logging** on Fabric workspace for compliance
+5. **Use private endpoints** for sensitive data workloads
+6. **Implement token caching** to reduce authentication overhead
+
+```python
+# Example: Secure credential handling with Azure Key Vault
+from azure.keyvault.secrets import SecretClient
+from azure.identity import DefaultAzureCredential
+
+def get_secure_credential():
+    """Retrieve credentials from Azure Key Vault."""
+    credential = DefaultAzureCredential()
+    vault_url = "https://fabric-agent-vault.vault.azure.net"
+    
+    secret_client = SecretClient(vault_url=vault_url, credential=credential)
+    
+    # For scenarios requiring explicit credentials
+    client_secret = secret_client.get_secret("fabric-agent-client-secret")
+    return client_secret.value
+```
 
 ---
 
