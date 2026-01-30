@@ -1,8 +1,10 @@
-# Multi-Fabric Data Agent Orchestration Architecture
+# Multi-Fabric Data Agent Orchestration Architecture (Microsoft Agent Framework)
 
 ## Overview
 
 This architecture describes a **Foundry Agent** that leverages **Azure AI Agent Service**, **Microsoft Foundry** (formerly Azure AI Foundry), and the **Microsoft Agent Framework** to orchestrate multiple **Fabric Data Agents** for unified data operations across Microsoft Fabric workspaces.
+
+> **Note:** For an alternative implementation using LangGraph, see [ARCHITECTURE-LANGGRAPH.md](ARCHITECTURE-LANGGRAPH.md).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
