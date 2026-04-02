@@ -885,6 +885,628 @@ fabric_auth = FabricAuthenticator()
 
 ---
 
+## Agent Interaction Context Management
+
+Managing context across agent interactions is critical for coherent multi-turn conversations, cross-agent coordination, and maintaining system state across the orchestration lifecycle.
+
+### Context Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        CONTEXT MANAGEMENT ARCHITECTURE                           │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Session       │     │   Agent         │     │   System        │
+│   Context       │     │   Context       │     │   Context       │
+│  ───────────    │     │  ───────────    │     │  ───────────    │
+│  • User prefs   │     │  • Agent memory │     │  • Workspace    │
+│  • Conv history │     │  • Tool results │     │  • Connections  │
+│  • Thread ID    │     │  • Error state  │     │  • Permissions  │
+└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+         │                       │                       │
+         └───────────────────────┼───────────────────────┘
+                                 │
+                                 ▼
+                  ┌──────────────────────────────┐
+                  │     Context Store            │
+                  │  • MemorySaver (in-memory)   │
+                  │  • SqliteSaver (persistent)  │
+                  │  • PostgresSaver (scalable)  │
+                  │  • CosmosDBSaver (cloud)     │
+                  └──────────────────────────────┘
+```
+
+### Context Types
+
+#### 1. Session Context
+Tracks information scoped to a user session or conversation thread.
+
+```python
+from typing import TypedDict, Annotated, Sequence
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+from datetime import datetime
+
+class SessionContext(TypedDict):
+    """Session-scoped context for multi-turn conversations."""
+    
+    # Unique session/thread identifier
+    thread_id: str
+    
+    # User identity and preferences
+    user_id: str | None
+    user_preferences: dict[str, Any]
+    
+    # Session timing
+    session_start: datetime
+    last_activity: datetime
+    
+    # Conversation summary for long sessions
+    conversation_summary: str | None
+    
+    # Token budget tracking
+    token_count: int
+    max_context_tokens: int
+```
+
+#### 2. Agent Context
+Maintains state specific to each specialized agent during execution.
+
+```python
+class AgentContext(TypedDict):
+    """Agent-specific execution context."""
+    
+    # Agent identification
+    agent_name: str
+    agent_type: Literal["lakehouse", "warehouse", "realtime", "pipeline", "powerbi"]
+    
+    # Execution history within this agent
+    tool_calls: list[dict[str, Any]]
+    intermediate_results: list[dict[str, Any]]
+    
+    # Agent-specific memory
+    discovered_schemas: dict[str, Any]  # Cached schema info
+    query_history: list[str]  # Recent queries for this agent
+    
+    # Performance tracking
+    execution_time_ms: int
+    retry_count: int
+```
+
+#### 3. Cross-Agent Context
+Enables context sharing between agents during handoffs and parallel execution.
+
+```python
+class CrossAgentContext(TypedDict):
+    """Context shared across agents during orchestration."""
+    
+    # Shared data artifacts
+    shared_results: dict[str, Any]
+    
+    # Handoff context
+    handoff_from: str | None
+    handoff_reason: str | None
+    handoff_context: dict[str, Any]
+    
+    # Parallel execution coordination
+    parallel_execution_id: str | None
+    pending_agents: list[str]
+    completed_agents: list[str]
+    
+    # Data lineage tracking
+    data_sources_used: list[str]
+    transformations_applied: list[str]
+```
+
+### Enhanced State Schema with Context Management
+
+```python
+from typing import TypedDict, Annotated, Literal, Sequence, Any
+from operator import add
+from datetime import datetime
+
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
+
+class ContextMetadata(TypedDict):
+    """Metadata for context lifecycle management."""
+    
+    created_at: datetime
+    updated_at: datetime
+    version: int
+    checksum: str | None
+
+
+class InteractionContext(TypedDict):
+    """Complete context for agent interactions."""
+    
+    # Session-level context
+    session: SessionContext
+    
+    # Per-agent context (keyed by agent name)
+    agents: dict[str, AgentContext]
+    
+    # Cross-agent shared context
+    shared: CrossAgentContext
+    
+    # Context metadata
+    metadata: ContextMetadata
+
+
+class EnhancedFabricAgentState(TypedDict):
+    """Enhanced state schema with comprehensive context management."""
+    
+    # Core conversation messages
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    
+    # Current agent handling the request
+    current_agent: Literal[
+        "orchestrator", "lakehouse", "warehouse", 
+        "realtime", "pipeline", "powerbi"
+    ] | None
+    
+    # Workspace configuration
+    workspace_id: str
+    
+    # Query metadata
+    query_type: Literal["spark", "tsql", "kql", "dax", "pipeline"] | None
+    query_results: dict[str, Any] | None
+    
+    # Error tracking
+    error: str | None
+    
+    # Routing
+    next_agent: Literal[
+        "lakehouse", "warehouse", "realtime", 
+        "pipeline", "powerbi", "end"
+    ] | None
+    
+    # Human-in-the-loop
+    requires_approval: bool
+    
+    # === NEW: Interaction Context ===
+    interaction_context: InteractionContext
+```
+
+### Context Lifecycle Management
+
+#### Context Creation
+
+```python
+from datetime import datetime
+from uuid import uuid4
+import hashlib
+
+def create_interaction_context(
+    thread_id: str | None = None,
+    user_id: str | None = None,
+    max_context_tokens: int = 128000
+) -> InteractionContext:
+    """Initialize a new interaction context.
+    
+    Args:
+        thread_id: Optional existing thread ID. Generates new if not provided.
+        user_id: Optional user identifier for preference tracking.
+        max_context_tokens: Maximum tokens allowed in context window.
+        
+    Returns:
+        Initialized InteractionContext.
+    """
+    now = datetime.utcnow()
+    tid = thread_id or str(uuid4())
+    
+    return InteractionContext(
+        session=SessionContext(
+            thread_id=tid,
+            user_id=user_id,
+            user_preferences={},
+            session_start=now,
+            last_activity=now,
+            conversation_summary=None,
+            token_count=0,
+            max_context_tokens=max_context_tokens,
+        ),
+        agents={},
+        shared=CrossAgentContext(
+            shared_results={},
+            handoff_from=None,
+            handoff_reason=None,
+            handoff_context={},
+            parallel_execution_id=None,
+            pending_agents=[],
+            completed_agents=[],
+            data_sources_used=[],
+            transformations_applied=[],
+        ),
+        metadata=ContextMetadata(
+            created_at=now,
+            updated_at=now,
+            version=1,
+            checksum=None,
+        ),
+    )
+```
+
+#### Context Updates During Agent Handoffs
+
+```python
+def update_context_for_handoff(
+    state: EnhancedFabricAgentState,
+    from_agent: str,
+    to_agent: str,
+    reason: str,
+    context_data: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Update context when handing off between agents.
+    
+    Args:
+        state: Current workflow state.
+        from_agent: Name of the source agent.
+        to_agent: Name of the target agent.
+        reason: Explanation for the handoff.
+        context_data: Optional data to pass to the target agent.
+        
+    Returns:
+        State update dictionary.
+    """
+    ctx = state["interaction_context"]
+    shared = ctx["shared"]
+    
+    # Update shared context
+    updated_shared = CrossAgentContext(
+        **shared,
+        handoff_from=from_agent,
+        handoff_reason=reason,
+        handoff_context=context_data or {},
+    )
+    
+    # Create agent context for source if not exists
+    agents = dict(ctx["agents"])
+    if from_agent not in agents:
+        agents[from_agent] = AgentContext(
+            agent_name=from_agent,
+            agent_type=from_agent,
+            tool_calls=[],
+            intermediate_results=[],
+            discovered_schemas={},
+            query_history=[],
+            execution_time_ms=0,
+            retry_count=0,
+        )
+    
+    # Update metadata
+    updated_metadata = ContextMetadata(
+        **ctx["metadata"],
+        updated_at=datetime.utcnow(),
+        version=ctx["metadata"]["version"] + 1,
+    )
+    
+    return {
+        "interaction_context": InteractionContext(
+            session=ctx["session"],
+            agents=agents,
+            shared=updated_shared,
+            metadata=updated_metadata,
+        )
+    }
+```
+
+### Context Summarization for Long Conversations
+
+When conversations exceed token limits, context is summarized to preserve essential information.
+
+```python
+from langchain_core.messages import SystemMessage, HumanMessage
+
+SUMMARIZATION_PROMPT = """Summarize the following conversation history, preserving:
+1. Key user intents and goals
+2. Important data sources and tables referenced
+3. Query results and findings
+4. Any errors encountered and how they were resolved
+5. Current state of the analysis
+
+Conversation:
+{conversation}
+
+Provide a concise summary that captures the essential context for continuing the analysis."""
+
+
+async def summarize_context_if_needed(
+    state: EnhancedFabricAgentState,
+    llm: AzureChatOpenAI,
+    summarization_threshold: float = 0.8
+) -> dict[str, Any]:
+    """Summarize conversation context if approaching token limits.
+    
+    Args:
+        state: Current workflow state.
+        llm: Language model for summarization.
+        summarization_threshold: Trigger summarization at this % of max tokens.
+        
+    Returns:
+        State update with summarized context if triggered.
+    """
+    ctx = state["interaction_context"]
+    session = ctx["session"]
+    
+    # Check if summarization is needed
+    token_ratio = session["token_count"] / session["max_context_tokens"]
+    if token_ratio < summarization_threshold:
+        return {}  # No summarization needed
+    
+    # Build conversation text for summarization
+    messages = state["messages"]
+    conversation_text = "\n".join([
+        f"{msg.type}: {msg.content}" 
+        for msg in messages[-20:]  # Last 20 messages
+    ])
+    
+    # Generate summary
+    summary_prompt = SUMMARIZATION_PROMPT.format(conversation=conversation_text)
+    response = await llm.ainvoke([HumanMessage(content=summary_prompt)])
+    
+    # Update session with summary
+    updated_session = SessionContext(
+        **session,
+        conversation_summary=response.content,
+        last_activity=datetime.utcnow(),
+    )
+    
+    # Trim messages to recent ones plus summary
+    from langchain_core.messages import SystemMessage
+    summary_message = SystemMessage(
+        content=f"[Previous conversation summary]: {response.content}"
+    )
+    
+    return {
+        "messages": [summary_message] + list(messages[-5:]),
+        "interaction_context": InteractionContext(
+            session=updated_session,
+            agents=ctx["agents"],
+            shared=ctx["shared"],
+            metadata=ContextMetadata(
+                **ctx["metadata"],
+                updated_at=datetime.utcnow(),
+                version=ctx["metadata"]["version"] + 1,
+            ),
+        ),
+    }
+```
+
+### Persistent Context Storage
+
+#### Using LangGraph Checkpointers
+
+```python
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+# Development: In-memory checkpointing
+dev_checkpointer = MemorySaver()
+
+# Local persistence: SQLite
+local_checkpointer = SqliteSaver.from_conn_string("fabric_agent_context.db")
+
+# Production: PostgreSQL with async support
+async def create_production_checkpointer():
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    
+    conn_string = os.environ["POSTGRES_CONNECTION_STRING"]
+    checkpointer = await AsyncPostgresSaver.from_conn_string(conn_string)
+    await checkpointer.setup()  # Create tables if needed
+    return checkpointer
+
+# Cloud-native: Azure Cosmos DB (custom implementation)
+class CosmosDBSaver:
+    """Custom checkpointer for Azure Cosmos DB."""
+    
+    def __init__(self, endpoint: str, database: str, container: str):
+        from azure.cosmos import CosmosClient
+        from azure.identity import DefaultAzureCredential
+        
+        credential = DefaultAzureCredential()
+        self.client = CosmosClient(endpoint, credential)
+        self.container = (
+            self.client.get_database_client(database)
+            .get_container_client(container)
+        )
+    
+    def get(self, thread_id: str) -> dict | None:
+        """Retrieve checkpoint for a thread."""
+        try:
+            return self.container.read_item(
+                item=thread_id,
+                partition_key=thread_id
+            )
+        except Exception:
+            return None
+    
+    def put(self, thread_id: str, checkpoint: dict) -> None:
+        """Store checkpoint for a thread."""
+        checkpoint["id"] = thread_id
+        checkpoint["_partition_key"] = thread_id
+        self.container.upsert_item(checkpoint)
+```
+
+### Context-Aware Workflow Compilation
+
+```python
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres import PostgresSaver
+
+def build_context_aware_workflow(
+    checkpointer: PostgresSaver | MemorySaver | None = None
+) -> CompiledStateGraph:
+    """Build workflow with context management.
+    
+    Args:
+        checkpointer: Optional checkpointer for state persistence.
+        
+    Returns:
+        Compiled StateGraph with context management.
+    """
+    workflow = StateGraph(EnhancedFabricAgentState)
+    
+    # Add context initialization node
+    workflow.add_node("init_context", init_context_node)
+    
+    # Add core orchestration nodes
+    workflow.add_node("orchestrator", context_aware_orchestrator_node)
+    workflow.add_node("lakehouse", context_aware_lakehouse_node)
+    workflow.add_node("warehouse", context_aware_warehouse_node)
+    workflow.add_node("realtime", context_aware_realtime_node)
+    
+    # Add context management nodes
+    workflow.add_node("summarize_context", summarize_context_node)
+    workflow.add_node("persist_context", persist_context_node)
+    
+    # Entry point initializes context
+    workflow.set_entry_point("init_context")
+    workflow.add_edge("init_context", "orchestrator")
+    
+    # Conditional routing from orchestrator
+    workflow.add_conditional_edges(
+        "orchestrator",
+        route_with_context,
+        {
+            "lakehouse": "lakehouse",
+            "warehouse": "warehouse",
+            "realtime": "realtime",
+            "summarize": "summarize_context",
+            "end": END
+        }
+    )
+    
+    # Agents return through context persistence
+    for agent in ["lakehouse", "warehouse", "realtime"]:
+        workflow.add_edge(agent, "persist_context")
+    
+    workflow.add_edge("persist_context", "orchestrator")
+    workflow.add_edge("summarize_context", "orchestrator")
+    
+    # Compile with checkpointer
+    return workflow.compile(checkpointer=checkpointer)
+
+
+def route_with_context(state: EnhancedFabricAgentState) -> str:
+    """Route based on next_agent and context state.
+    
+    Checks if context summarization is needed before routing.
+    """
+    ctx = state["interaction_context"]
+    session = ctx["session"]
+    
+    # Check if context summarization is needed
+    if session["token_count"] > session["max_context_tokens"] * 0.8:
+        return "summarize"
+    
+    next_agent = state.get("next_agent", "end")
+    if next_agent in ["lakehouse", "warehouse", "realtime"]:
+        return next_agent
+    return "end"
+```
+
+### Context-Aware Node Implementation
+
+```python
+def context_aware_orchestrator_node(
+    state: EnhancedFabricAgentState
+) -> dict[str, Any]:
+    """Orchestrator node with context awareness.
+    
+    Enriches routing decisions with historical context.
+    """
+    llm = get_llm()
+    ctx = state["interaction_context"]
+    
+    # Build context-aware system prompt
+    context_info = ""
+    if ctx["session"]["conversation_summary"]:
+        context_info += f"\nPrevious context: {ctx['session']['conversation_summary']}"
+    
+    if ctx["shared"]["handoff_from"]:
+        context_info += f"\nHandoff from {ctx['shared']['handoff_from']}: {ctx['shared']['handoff_reason']}"
+    
+    if ctx["shared"]["data_sources_used"]:
+        context_info += f"\nData sources used: {', '.join(ctx['shared']['data_sources_used'])}"
+    
+    enhanced_prompt = ORCHESTRATOR_SYSTEM_PROMPT + context_info
+    
+    messages = [SystemMessage(content=enhanced_prompt)] + list(state["messages"])
+    response = llm.invoke(messages)
+    
+    next_agent = response.content.strip().lower()
+    valid_agents = ["lakehouse", "warehouse", "realtime", "end"]
+    if next_agent not in valid_agents:
+        next_agent = "end"
+    
+    # Update agent context and handoff info
+    return {
+        "next_agent": next_agent,
+        "current_agent": "orchestrator",
+        **update_context_for_handoff(
+            state, "orchestrator", next_agent, "User request routing"
+        )
+    }
+```
+
+### Thread Management for Multi-User Scenarios
+
+```python
+# Usage example with thread isolation
+async def handle_user_request(
+    user_id: str,
+    thread_id: str,
+    query: str,
+    workflow: CompiledStateGraph
+) -> dict:
+    """Handle a user request with proper context isolation.
+    
+    Args:
+        user_id: The user's identifier.
+        thread_id: The conversation thread ID.
+        query: User's query.
+        workflow: Compiled workflow with checkpointer.
+        
+    Returns:
+        Agent response with updated context.
+    """
+    from langchain_core.messages import HumanMessage
+    
+    # Configuration for thread isolation
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "user_id": user_id,
+        }
+    }
+    
+    # Get existing state or create new
+    existing_state = workflow.get_state(config)
+    
+    if existing_state.values:
+        # Continue existing conversation
+        input_state = {"messages": [HumanMessage(content=query)]}
+    else:
+        # New conversation - create full initial state
+        input_state = create_initial_enhanced_state(
+            workspace_id=os.environ["FABRIC_WORKSPACE_ID"],
+            query=query,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
+    
+    # Invoke workflow
+    result = await workflow.ainvoke(input_state, config)
+    
+    return result
+```
+
+---
+
 ## Deployment Architecture
 
 ### Azure Resources

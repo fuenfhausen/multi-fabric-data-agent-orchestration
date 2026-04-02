@@ -12,3 +12,7 @@ pydantic-settings>=2.1.0
 # Microsoft Agent Framework (preview)
 # Note: --pre flag required during installation
 agent-framework-azure-ai>=0.1.0
+
+# Context persistence (optional - pick based on deployment)
+redis>=5.0.0  # For Redis context store
+azure-cosmos>=4.5.0  # For Cosmos DB context store

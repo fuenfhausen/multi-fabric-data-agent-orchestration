@@ -668,6 +668,636 @@ def get_secure_credential():
 
 ---
 
+## Agent Interaction Context Management
+
+Managing context across agent interactions is essential for maintaining coherent multi-turn conversations, enabling effective agent handoffs, and preserving system state throughout the orchestration lifecycle.
+
+### Context Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        CONTEXT MANAGEMENT ARCHITECTURE                           │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Session       │     │   Agent         │     │   System        │
+│   Context       │     │   Context       │     │   Context       │
+│  ───────────    │     │  ───────────    │     │  ───────────    │
+│  • Thread state │     │  • Agent memory │     │  • Workspace    │
+│  • Conv history │     │  • Tool results │     │  • Connections  │
+│  • User prefs   │     │  • Handoff data │     │  • Permissions  │
+└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+         │                       │                       │
+         └───────────────────────┼───────────────────────┘
+                                 │
+                                 ▼
+                  ┌──────────────────────────────┐
+                  │    Context Store             │
+                  │  • In-Memory (dev)           │
+                  │  • Azure Cosmos DB (prod)    │
+                  │  • Azure Redis Cache         │
+                  │  • Thread-based isolation    │
+                  └──────────────────────────────┘
+```
+
+### Context Types
+
+#### 1. Session Context
+Tracks information scoped to a user session or conversation thread.
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+@dataclass
+class SessionContext:
+    """Session-scoped context for multi-turn conversations."""
+    
+    # Unique session/thread identifier
+    thread_id: str
+    
+    # User identity and preferences
+    user_id: str | None = None
+    user_preferences: dict[str, Any] = field(default_factory=dict)
+    
+    # Session timing
+    session_start: datetime = field(default_factory=datetime.utcnow)
+    last_activity: datetime = field(default_factory=datetime.utcnow)
+    
+    # Conversation summary for long sessions
+    conversation_summary: str | None = None
+    
+    # Message history tracking
+    message_count: int = 0
+    max_messages_before_summary: int = 20
+```
+
+#### 2. Agent Context
+Maintains state specific to each specialized agent during execution.
+
+```python
+from dataclasses import dataclass, field
+from typing import Literal, Any
+
+@dataclass
+class AgentContext:
+    """Agent-specific execution context."""
+    
+    # Agent identification
+    agent_name: str
+    agent_type: Literal["lakehouse", "warehouse", "realtime", "pipeline", "powerbi"]
+    
+    # Execution history
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    intermediate_results: list[dict[str, Any]] = field(default_factory=list)
+    
+    # Agent-specific memory
+    discovered_schemas: dict[str, Any] = field(default_factory=dict)
+    query_history: list[str] = field(default_factory=list)
+    
+    # Performance tracking
+    execution_time_ms: int = 0
+    retry_count: int = 0
+    
+    def add_tool_call(self, tool_name: str, args: dict, result: Any) -> None:
+        """Record a tool invocation."""
+        self.tool_calls.append({
+            "tool": tool_name,
+            "args": args,
+            "result": result,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+```
+
+#### 3. Handoff Context
+Enables context passing between agents during orchestration handoffs.
+
+```python
+@dataclass
+class HandoffContext:
+    """Context passed during agent handoffs."""
+    
+    # Source and target agents
+    from_agent: str
+    to_agent: str
+    
+    # Handoff reason and metadata
+    reason: str
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    
+    # Data being passed
+    shared_data: dict[str, Any] = field(default_factory=dict)
+    
+    # Query/task continuation info
+    pending_task: str | None = None
+    task_context: dict[str, Any] = field(default_factory=dict)
+    
+    # Data lineage
+    data_sources_used: list[str] = field(default_factory=list)
+    transformations_applied: list[str] = field(default_factory=list)
+```
+
+### Interaction Context Manager
+
+A comprehensive manager class for handling all context types:
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+from uuid import uuid4
+
+@dataclass
+class InteractionContext:
+    """Complete context manager for agent interactions."""
+    
+    # Core contexts
+    session: SessionContext
+    agents: dict[str, AgentContext] = field(default_factory=dict)
+    
+    # Handoff tracking
+    handoff_history: list[HandoffContext] = field(default_factory=list)
+    current_handoff: HandoffContext | None = None
+    
+    # System context
+    workspace_id: str = ""
+    active_connections: list[str] = field(default_factory=list)
+    
+    # Metadata
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    version: int = 1
+    
+    @classmethod
+    def create(
+        cls,
+        thread_id: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str = ""
+    ) -> "InteractionContext":
+        """Factory method to create a new interaction context."""
+        return cls(
+            session=SessionContext(
+                thread_id=thread_id or str(uuid4()),
+                user_id=user_id,
+            ),
+            workspace_id=workspace_id,
+        )
+    
+    def get_or_create_agent_context(
+        self,
+        agent_name: str,
+        agent_type: str
+    ) -> AgentContext:
+        """Get existing agent context or create new one."""
+        if agent_name not in self.agents:
+            self.agents[agent_name] = AgentContext(
+                agent_name=agent_name,
+                agent_type=agent_type,
+            )
+        return self.agents[agent_name]
+    
+    def record_handoff(
+        self,
+        from_agent: str,
+        to_agent: str,
+        reason: str,
+        shared_data: dict[str, Any] | None = None
+    ) -> HandoffContext:
+        """Record a handoff between agents."""
+        handoff = HandoffContext(
+            from_agent=from_agent,
+            to_agent=to_agent,
+            reason=reason,
+            shared_data=shared_data or {},
+        )
+        
+        # Archive current handoff if exists
+        if self.current_handoff:
+            self.handoff_history.append(self.current_handoff)
+        
+        self.current_handoff = handoff
+        self.updated_at = datetime.utcnow()
+        self.version += 1
+        
+        return handoff
+    
+    def get_context_for_agent(self, agent_name: str) -> dict[str, Any]:
+        """Get relevant context for a specific agent."""
+        context = {
+            "thread_id": self.session.thread_id,
+            "workspace_id": self.workspace_id,
+            "conversation_summary": self.session.conversation_summary,
+        }
+        
+        # Include handoff context if this agent is the target
+        if self.current_handoff and self.current_handoff.to_agent == agent_name:
+            context["handoff"] = {
+                "from": self.current_handoff.from_agent,
+                "reason": self.current_handoff.reason,
+                "data": self.current_handoff.shared_data,
+                "pending_task": self.current_handoff.pending_task,
+            }
+        
+        # Include agent's own history
+        if agent_name in self.agents:
+            agent_ctx = self.agents[agent_name]
+            context["previous_queries"] = agent_ctx.query_history[-5:]
+            context["discovered_schemas"] = agent_ctx.discovered_schemas
+        
+        return context
+```
+
+### Context-Aware Agent Implementation
+
+#### Enhanced Orchestrator with Context
+
+```python
+from agent_framework import ChatAgent, HandoffBuilder
+from agent_framework.azure import AzureOpenAIChatClient
+
+class ContextAwareOrchestrator:
+    """Orchestrator that maintains and uses interaction context."""
+    
+    def __init__(
+        self,
+        chat_client: AzureOpenAIChatClient,
+        context_store: "ContextStore"
+    ):
+        self.chat_client = chat_client
+        self.context_store = context_store
+        
+        self.agent = ChatAgent(
+            chat_client=chat_client,
+            name="fabric_orchestrator",
+            description="Context-aware Fabric data orchestrator",
+            instructions=self._build_instructions(),
+        )
+    
+    def _build_instructions(self) -> str:
+        return """You are a Microsoft Fabric Data Orchestrator with full context awareness.
+
+When routing requests:
+1. Consider the conversation history and previous agent interactions
+2. Use handoff context to understand what the previous agent accomplished
+3. Track data sources used across the conversation
+4. Maintain continuity when users refer to previous results
+
+Route to specialists based on:
+- **Lakehouse Agent**: Delta Lake, Spark SQL, PySpark, lakehouse files
+- **Warehouse Agent**: T-SQL, data warehouse, semantic models
+- **Real-Time Agent**: KQL, streaming, real-time analytics
+
+Always include relevant context when handing off to specialists."""
+    
+    async def process_with_context(
+        self,
+        thread_id: str,
+        user_message: str
+    ) -> str:
+        """Process a message with full context awareness."""
+        
+        # Load or create context
+        context = await self.context_store.get_or_create(thread_id)
+        
+        # Update session activity
+        context.session.last_activity = datetime.utcnow()
+        context.session.message_count += 1
+        
+        # Check if summarization needed
+        if context.session.message_count >= context.session.max_messages_before_summary:
+            await self._summarize_conversation(context)
+        
+        # Build context-aware prompt
+        system_context = self._build_context_prompt(context)
+        
+        # Process with agent (context injected into system prompt)
+        response = await self.agent.process(
+            message=user_message,
+            system_context=system_context,
+        )
+        
+        # Save updated context
+        await self.context_store.save(context)
+        
+        return response
+    
+    def _build_context_prompt(self, context: InteractionContext) -> str:
+        """Build context information for the system prompt."""
+        parts = []
+        
+        if context.session.conversation_summary:
+            parts.append(f"Conversation Summary: {context.session.conversation_summary}")
+        
+        if context.current_handoff:
+            h = context.current_handoff
+            parts.append(f"Previous Agent: {h.from_agent}")
+            parts.append(f"Handoff Reason: {h.reason}")
+            if h.data_sources_used:
+                parts.append(f"Data Sources Used: {', '.join(h.data_sources_used)}")
+        
+        if context.workspace_id:
+            parts.append(f"Workspace: {context.workspace_id}")
+        
+        return "\n".join(parts) if parts else ""
+    
+    async def _summarize_conversation(self, context: InteractionContext) -> None:
+        """Summarize conversation when it gets too long."""
+        # Implementation would call LLM to summarize
+        pass
+```
+
+#### Context-Aware Handoff Pattern
+
+```python
+from agent_framework import HandoffBuilder
+
+def build_context_aware_workflow(
+    orchestrator: ChatAgent,
+    lakehouse_agent: ChatAgent,
+    warehouse_agent: ChatAgent,
+    realtime_agent: ChatAgent,
+    context: InteractionContext,
+) -> "AgentWorkflow":
+    """Build workflow with context passing on handoffs."""
+    
+    # Create context-aware handoff callbacks
+    def on_handoff(from_agent: str, to_agent: str, reason: str):
+        """Callback executed on each handoff."""
+        context.record_handoff(
+            from_agent=from_agent,
+            to_agent=to_agent,
+            reason=reason,
+            shared_data={
+                "workspace_id": context.workspace_id,
+                "summary": context.session.conversation_summary,
+            }
+        )
+    
+    def get_agent_context(agent_name: str) -> dict[str, Any]:
+        """Get context for injecting into agent."""
+        return context.get_context_for_agent(agent_name)
+    
+    # Build workflow with context hooks
+    workflow = (
+        HandoffBuilder(
+            name="context_aware_fabric_orchestration",
+            participants=[orchestrator, lakehouse_agent, warehouse_agent, realtime_agent]
+        )
+        .with_start_agent(orchestrator)
+        .add_handoff(orchestrator, [lakehouse_agent, warehouse_agent, realtime_agent])
+        .add_handoff(lakehouse_agent, [orchestrator])
+        .add_handoff(warehouse_agent, [orchestrator])
+        .add_handoff(realtime_agent, [orchestrator])
+        .with_handoff_callback(on_handoff)
+        .with_context_provider(get_agent_context)
+        .build()
+    )
+    
+    return workflow
+```
+
+### Context Storage Implementations
+
+#### In-Memory Store (Development)
+
+```python
+from threading import Lock
+
+class InMemoryContextStore:
+    """Thread-safe in-memory context store for development."""
+    
+    def __init__(self):
+        self._store: dict[str, InteractionContext] = {}
+        self._lock = Lock()
+    
+    async def get_or_create(
+        self,
+        thread_id: str,
+        user_id: str | None = None,
+        workspace_id: str = ""
+    ) -> InteractionContext:
+        """Get existing context or create new one."""
+        with self._lock:
+            if thread_id not in self._store:
+                self._store[thread_id] = InteractionContext.create(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                )
+            return self._store[thread_id]
+    
+    async def save(self, context: InteractionContext) -> None:
+        """Save context to store."""
+        with self._lock:
+            context.updated_at = datetime.utcnow()
+            self._store[context.session.thread_id] = context
+    
+    async def delete(self, thread_id: str) -> None:
+        """Delete context from store."""
+        with self._lock:
+            self._store.pop(thread_id, None)
+```
+
+#### Azure Cosmos DB Store (Production)
+
+```python
+from azure.cosmos.aio import CosmosClient
+from azure.identity.aio import DefaultAzureCredential
+import json
+
+class CosmosDBContextStore:
+    """Production context store using Azure Cosmos DB."""
+    
+    def __init__(
+        self,
+        endpoint: str,
+        database_name: str,
+        container_name: str
+    ):
+        self.endpoint = endpoint
+        self.database_name = database_name
+        self.container_name = container_name
+        self._client: CosmosClient | None = None
+        self._container = None
+    
+    async def _ensure_client(self):
+        """Lazy initialization of Cosmos client."""
+        if self._client is None:
+            credential = DefaultAzureCredential()
+            self._client = CosmosClient(self.endpoint, credential)
+            database = self._client.get_database_client(self.database_name)
+            self._container = database.get_container_client(self.container_name)
+    
+    async def get_or_create(
+        self,
+        thread_id: str,
+        user_id: str | None = None,
+        workspace_id: str = ""
+    ) -> InteractionContext:
+        """Get existing context or create new one."""
+        await self._ensure_client()
+        
+        try:
+            item = await self._container.read_item(
+                item=thread_id,
+                partition_key=thread_id
+            )
+            return self._deserialize(item)
+        except Exception:
+            # Create new context
+            return InteractionContext.create(
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+    
+    async def save(self, context: InteractionContext) -> None:
+        """Save context to Cosmos DB."""
+        await self._ensure_client()
+        
+        item = self._serialize(context)
+        item["id"] = context.session.thread_id
+        item["_partitionKey"] = context.session.thread_id
+        item["ttl"] = 86400 * 7  # 7 day TTL
+        
+        await self._container.upsert_item(item)
+    
+    def _serialize(self, context: InteractionContext) -> dict:
+        """Serialize context to JSON-compatible dict."""
+        # Implementation converts dataclasses to dicts
+        pass
+    
+    def _deserialize(self, item: dict) -> InteractionContext:
+        """Deserialize context from Cosmos DB item."""
+        # Implementation reconstructs dataclasses from dicts
+        pass
+```
+
+#### Azure Redis Cache Store (High-Performance)
+
+```python
+import redis.asyncio as redis
+import json
+
+class RedisContextStore:
+    """High-performance context store using Azure Redis Cache."""
+    
+    def __init__(self, connection_string: str, ttl_seconds: int = 3600):
+        self.connection_string = connection_string
+        self.ttl_seconds = ttl_seconds
+        self._client: redis.Redis | None = None
+    
+    async def _ensure_client(self):
+        """Lazy initialization of Redis client."""
+        if self._client is None:
+            self._client = redis.from_url(self.connection_string)
+    
+    async def get_or_create(
+        self,
+        thread_id: str,
+        user_id: str | None = None,
+        workspace_id: str = ""
+    ) -> InteractionContext:
+        """Get existing context or create new one."""
+        await self._ensure_client()
+        
+        key = f"context:{thread_id}"
+        data = await self._client.get(key)
+        
+        if data:
+            return self._deserialize(json.loads(data))
+        
+        return InteractionContext.create(
+            thread_id=thread_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+    
+    async def save(self, context: InteractionContext) -> None:
+        """Save context with TTL."""
+        await self._ensure_client()
+        
+        key = f"context:{context.session.thread_id}"
+        data = json.dumps(self._serialize(context))
+        
+        await self._client.setex(key, self.ttl_seconds, data)
+```
+
+### Context Summarization
+
+For long-running conversations, summarize context to stay within token limits:
+
+```python
+async def summarize_context(
+    context: InteractionContext,
+    chat_client: AzureOpenAIChatClient,
+    messages: list[str]
+) -> str:
+    """Generate a summary of the conversation for context compression."""
+    
+    prompt = f"""Summarize the following conversation, preserving:
+1. Key user intents and goals
+2. Important data sources and tables referenced
+3. Query results and key findings
+4. Any errors encountered and resolutions
+5. Current state of the analysis
+
+Conversation:
+{chr(10).join(messages[-20:])}
+
+Provide a concise summary (max 500 words) that captures essential context."""
+    
+    response = await chat_client.generate(prompt)
+    
+    # Update context with summary
+    context.session.conversation_summary = response
+    context.session.message_count = 0  # Reset counter
+    
+    return response
+```
+
+### Multi-User Thread Isolation
+
+```python
+async def handle_user_request(
+    user_id: str,
+    thread_id: str,
+    message: str,
+    orchestrator: ContextAwareOrchestrator,
+    context_store: "ContextStore"
+) -> str:
+    """Handle a user request with proper context isolation.
+    
+    Args:
+        user_id: The user's identifier.
+        thread_id: The conversation thread ID.
+        message: User's message.
+        orchestrator: The context-aware orchestrator.
+        context_store: Storage for interaction contexts.
+        
+    Returns:
+        Agent response.
+    """
+    # Load or create context for this thread
+    context = await context_store.get_or_create(
+        thread_id=thread_id,
+        user_id=user_id,
+        workspace_id=os.environ.get("FABRIC_WORKSPACE_ID", ""),
+    )
+    
+    # Process with context
+    response = await orchestrator.process_with_context(
+        thread_id=thread_id,
+        user_message=message,
+    )
+    
+    return response
+```
+
+---
+
 ## Deployment Architecture
 
 ### Azure Resources
